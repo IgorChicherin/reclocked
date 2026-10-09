@@ -1,0 +1,116 @@
+From 0017-nouveau-dgpu-disabled-sysfs Mon Sep 17 00:00:00 2001
+From: Igor Chicherin <ashzak990@gmail.com>
+Date: Fri, 9 Oct 2026 00:00:00 +0300
+Subject: [PATCH 0017/0017] nouveau: dgpu_disabled sysfs switch that refuses new opens
+
+With nouveau.runpm=1 on a hybrid laptop (MacBookPro11,3, patches 0006/0016)
+the dGPU is powered off while unused and powered up whenever a client opens
+it. That is the right default, but userspace has no way to keep it off: any
+DRI_PRIME=1 app or Vulkan device enumeration wakes it again, and vga_switcheroo
+ignores manual OFF for a driver-power-controlled client.
+
+Add /sys/bus/pci/devices/<dGPU>/dgpu_disabled (0/1, root-writable). While it is
+1, nouveau_drm_open() returns -ENODEV for new opens of the card and render
+nodes before calling pm_runtime_get_sync(), so the GPU is not woken: Mesa and
+the Vulkan loader treat the device as absent and stay on the iGPU. Clients
+that already have the device open keep working unchanged - in particular the
+compositor that opened the card node at login never gets an error - and once
+they go idle runtime PM suspends the GPU, which on a Mac cuts its power through
+gmux (0016).
+
+The flag resets to 0 on every boot and module load; reclocked's
+`reclockctl dgpu-off` sets it, `dgpu-auto`/`dgpu-on` clear it.
+
+Signed-off-by: Igor Chicherin <ashzak990@gmail.com>
+---
+ drivers/gpu/drm/nouveau/nouveau_drv.h |    3 ++
+ drivers/gpu/drm/nouveau/nouveau_drm.c |   45 +++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+
+--- a/drivers/gpu/drm/nouveau/nouveau_drv.h
++++ b/drivers/gpu/drm/nouveau/nouveau_drv.h
+@@ -297,6 +297,9 @@
+ 
+ 	struct dev_pm_domain vga_pm_domain;
+ 
++	/* dgpu_disabled sysfs attribute: refuse new opens, see nouveau_drm_open() */
++	bool open_disabled;
++
+ 	struct nouveau_svm *svm;
+ 
+ 	struct nouveau_dmem *dmem;
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -856,6 +856,42 @@
+ 	}
+ }
+ 
++/*
++ * dgpu_disabled: let userspace switch the dGPU off for good on a hybrid laptop.
++ * With runtime PM the GPU powers up whenever a client opens it (DRI_PRIME=1,
++ * Vulkan device enumeration), so "off" can't hold while anything may open it.
++ * While set, nouveau_drm_open() refuses new opens with -ENODEV before waking the
++ * GPU: Mesa and the Vulkan loader see no such device and stay on the iGPU, and
++ * once the existing clients go idle runtime PM suspends the GPU (on a Mac, gmux
++ * then cuts its power, patch 0016). Files already open keep working, so the
++ * compositor that opened the card at login never sees an error.
++ */
++static ssize_t
++dgpu_disabled_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct nouveau_drm *drm = pci_get_drvdata(to_pci_dev(dev));
++
++	return sysfs_emit(buf, "%d\n", READ_ONCE(drm->open_disabled));
++}
++
++static ssize_t
++dgpu_disabled_store(struct device *dev, struct device_attribute *attr,
++		    const char *buf, size_t count)
++{
++	struct nouveau_drm *drm = pci_get_drvdata(to_pci_dev(dev));
++	bool disabled;
++	int ret;
++
++	ret = kstrtobool(buf, &disabled);
++	if (ret)
++		return ret;
++
++	WRITE_ONCE(drm->open_disabled, disabled);
++	return count;
++}
++
++static DEVICE_ATTR_RW(dgpu_disabled);
++
+ static int nouveau_drm_probe(struct pci_dev *pdev,
+ 			     const struct pci_device_id *pent)
+ {
+@@ -906,6 +942,9 @@
+ 	drm_client_setup(drm->dev, format);
+ 
+ 	quirk_broken_nv_runpm(pdev);
++
++	if (device_create_file(&pdev->dev, &dev_attr_dgpu_disabled))
++		dev_warn(&pdev->dev, "failed to create dgpu_disabled\n");
+ 	return 0;
+ 
+ fail_pci:
+@@ -934,6 +973,8 @@
+ {
+ 	struct nouveau_drm *drm = pci_get_drvdata(pdev);
+ 
++	device_remove_file(&pdev->dev, &dev_attr_dgpu_disabled);
++
+ 	/* revert our workaround */
+ 	if (drm->old_pm_cap)
+ 		pdev->pm_cap = drm->old_pm_cap;
+@@ -1309,6 +1350,10 @@
+ 	char name[32];
+ 	int ret;
+ 
++	/* dgpu_disabled: new clients get "no such device" and the GPU stays asleep */
++	if (READ_ONCE(drm->open_disabled))
++		return -ENODEV;
++
+ 	/* need to bring up power immediately if opening device */
+ 	ret = pm_runtime_get_sync(dev->dev);
+ 	if (ret < 0 && ret != -EACCES) {

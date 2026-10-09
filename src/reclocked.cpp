@@ -327,6 +327,9 @@ static const char* IGPU_RPS_CUR = "/sys/class/drm/card1/gt/gt0/rps_cur_freq_mhz"
 static const char* SWITCH_STATUS_FILE = "/run/reclocked/status";
 static const char* SWITCH_DGPU_FILE = "/run/switchd/dgpu";
 static const char* DGPU_OVERRIDE_FILE = "/run/reclocked/dgpu-override";
+// Kernel patch 0017 (linux-lts-mbp): 1 = nouveau refuses new opens of the dGPU (-ENODEV) without
+// waking it, so under runtime PM nothing can power it back on. Absent on kernels without 0017.
+static const char* DGPU_DISABLED = "/sys/bus/pci/devices/0000:01:00.0/dgpu_disabled";
 
 // v5.0: BDF dGPU (GK107) i jego audio (HDA DIS-A 0000:01:00.1). Węzły DRM i
 // sound rozwiązywane przez BDF (DGPU_PCI / DGPU_AUDIO_PCI) — numeracja cardN/
@@ -2883,6 +2886,10 @@ public:
         // NIE bypassuj wait_idle — bramka bezpieczeństwa. "on" — power-on z
         // wait_ready jak normalnie. Status: pole "override" (""|"on"|"off").
         std::string ovr = dgpu_override();
+        // runpm: dgpu-off alone only hands the card to the kernel, and any DRI_PRIME/Vulkan
+        // client wakes it again. Lock it against new opens too (patch 0017); dgpu-on,
+        // dgpu-auto and no override unlock it.
+        if (power_.runpm()) sync_open_lock(ovr == "off");
         if (ovr == "on" || ovr == "off") {
             target_ = (ovr == "on") ? SwitchPolicy::DGPU : SwitchPolicy::IGPU;
             override_ = ovr;
@@ -2913,6 +2920,35 @@ public:
     }
 
     bool dgpu_off() const { return !power_state_.on(); }
+
+    // dgpu_disabled (patch 0017) to `want`; writes only on a change. Missing file =
+    // kernel without 0017: dgpu-off then can't keep clients from waking the card.
+    void sync_open_lock(bool want)
+    {
+        std::string cur;
+        if (read_file(DGPU_DISABLED, cur) != 0) {
+            open_lock_ = -1;
+            if (want && !open_lock_missing_logged_) {
+                logf(0, "switch: dgpu-off can't lock the dGPU: %s missing (kernel without patch 0017)",
+                     DGPU_DISABLED);
+                open_lock_missing_logged_ = true;
+            }
+            return;
+        }
+        open_lock_missing_logged_ = false;
+        bool now = trim(cur) == "1";
+        if (now != want) {
+            if (write_file(DGPU_DISABLED, want ? "1" : "0") == 0) {
+                now = want;
+                logf(1, "switch: dGPU %s (dgpu_disabled=%d)",
+                     want ? "locked: new clients get no device, it powers off once idle"
+                          : "unlocked: clients may wake it again", want ? 1 : 0);
+            } else {
+                logf(0, "switch: BŁĄD zapisu %s", DGPU_DISABLED);
+            }
+        }
+        open_lock_ = now ? 1 : 0;
+    }
 
     // Main-loop gate (every interval, not every tick). Under runpm the kernel can
     // suspend or wake the card between ticks: treat it as OFF if the last tick saw
@@ -3161,7 +3197,7 @@ private:
             "\"fan_curve\": \"%s\", \"fan_tmin\": %d, \"fan_tmax\": %d, "
             "\"fan_tmid\": %d, \"fan_pmid\": %d, "
             "\"fan_rpm1\": %d, \"fan_rpm2\": %d, "
-            "\"fan_case_avg\": %.1f, \"fan_case_state\": \"%s\", \"ts\": %lld }\n",
+            "\"fan_case_avg\": %.1f, \"fan_case_state\": \"%s\", \"open_lock\": %d, \"ts\": %lld }\n",
             topo_.name(), st.on() ? "on" : "off", dgpu_state_val,
             dgpu_input_active_, dgpu_video_,
             target_name(), json_escape(override_).c_str(),
@@ -3169,7 +3205,7 @@ private:
             json_escape(last_error_).c_str(), nvram_prefs_.c_str(), igpu_freq,
             g_fan_curve.c_str(), g_fan_tmin, g_fan_tmax, g_fan_tmid, g_fan_pmid,
             g_fan_rpm1, g_fan_rpm2,
-            g_fan_case_avg, g_fan_case_state,
+            g_fan_case_avg, g_fan_case_state, open_lock_,
             (long long)std::time(nullptr));
         write_file(SWITCH_STATUS_FILE, buf);
         write_file(SWITCH_DGPU_FILE, st.on() ? "on" : "off");
@@ -3186,6 +3222,8 @@ private:
     SwitchPolicy::Target target_ = SwitchPolicy::IGPU;
     DgpuPower::State power_state_;
     std::string nvram_prefs_ = "unknown";
+    int open_lock_ = -1;                    // dgpu_disabled: 1 locked, 0 open, -1 unknown/absent
+    bool open_lock_missing_logged_ = false;
     std::string last_action_ = "none";
     std::string last_error_;
     std::chrono::steady_clock::time_point last_switch_{};
@@ -3571,6 +3609,8 @@ int main(int argc, char** argv)
         // v4.2: zwróć wentylatory do auto SMC (fail-safe — nie zostawiaj manual).
         if (fan_ok) fan.restore_auto();
         if (pm_saved) write_file(POWER_CTRL, old_pm);
+        // Don't leave the dGPU locked (patch 0017) once nothing manages it anymore.
+        if (access(DGPU_DISABLED, W_OK) == 0) write_file(DGPU_DISABLED, "0");
     };
     std::signal(SIGINT, on_term);
     std::signal(SIGTERM, on_term);
