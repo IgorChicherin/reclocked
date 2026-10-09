@@ -2121,15 +2121,17 @@ static std::string dgpu_override()
 class DgpuPower {
 public:
     struct State {
-        std::string vgasw;    // "Pwr" | "Off" | "Dyn" | "DynOff" | ""
+        std::string vgasw;    // "Pwr" | "Off" | "DynPwr" | "DynOff" | ""
         std::string runtime;  // "active" | "suspended" | "unsupported" | ""
         // vgaswitcheroo jest AUTORYTATYWNY: po odcięciu gmux (DISCRETE_POWER=OFF,
         // PCI D3hot) nouveau zgłasza stale runtime_status="active", mimo że karta
         // jest martwa — sam runtime kłamałby (raport 63: busy=1000‰ na martwej
         // karcie, boost pstate). "Off"/"DynOff" = OFF. runtime tylko jako fallback
         // (backend runpm bez vgaswitcheroo).
+        // Runtime PM (nouveau.runpm=1): vga_switcheroo prints "Dyn" + "Pwr"/"Off"
+        // (drivers/gpu/vga/vga_switcheroo.c) — "DynPwr" is ON, "DynOff" is OFF.
         bool on() const {
-            if (!vgasw.empty()) return vgasw == "Pwr" || vgasw == "Dyn";
+            if (!vgasw.empty()) return vgasw == "Pwr" || vgasw == "DynPwr";
             return runtime == "active";
         }
     };
@@ -2139,6 +2141,16 @@ public:
           last_busy_nonzero_(std::chrono::steady_clock::now()) {}
 
     void set_recover_cb(std::function<bool()> cb) { recover_cb_ = std::move(cb); }
+
+    bool runpm() const { return backend_ == "runpm"; }
+
+    // power/control: "auto" = the kernel may runtime-suspend the card, "on" = held awake.
+    std::string control() const
+    {
+        std::string c;
+        read_file(POWER_CTRL, c);
+        return trim(c);
+    }
 
     State read() const
     {
@@ -2841,6 +2853,23 @@ public:
     // v5.7: cpu_temp — temp CPU (coretemp, °C, -1 gdy brak) dla cpu-temp-gate.
     void tick(HyprCtl& hypr, int temp, uint32_t last_busy, int cpu_temp)
     {
+        // runpm: the kernel powers the card up on its own when a client opens it
+        // (DRI_PRIME=1, PrefersNonDefaultGPU, Vulkan enumeration). set_on() never ran,
+        // so run the same recovery as after our own power-on: fresh BAR0 mapping,
+        // hwmon re-scan, pstate settle window before the first clock change.
+        if (power_.runpm() && !power_state_.on()) {
+            auto st = power_.read();
+            if (st.on()) {
+                logf(1, "switch: dGPU woken by the kernel (runtime PM, client opened it) — recovery");
+                last_switch_ = std::chrono::steady_clock::now();
+                if (recover_after_power_on()) {
+                    last_action_ = "kernel-wake";
+                    last_error_.clear();
+                }
+                power_state_ = power_.read();
+            }
+        }
+
         // Własne hyprctl (activewindow) — niezależne od pollingu pstate.
         // v5.6: tytuł okna przekazywany do polityki — promocja tytułowa
         // Discord/YouTube ([preferred-titles]) w decide().
@@ -2884,6 +2913,16 @@ public:
     }
 
     bool dgpu_off() const { return !power_state_.on(); }
+
+    // Main-loop gate (every interval, not every tick). Under runpm the kernel can
+    // suspend or wake the card between ticks: treat it as OFF if the last tick saw
+    // it off (a kernel wake waits for tick() recovery) or if it is off right now
+    // (sampling BAR0 of a suspended card reads 0xffffffff = phantom 1000‰ busy).
+    bool dgpu_off_live() const
+    {
+        if (!power_.runpm()) return dgpu_off();
+        return dgpu_off() || !power_.read().on();
+    }
 
     // v5.0: settle po power-on — nie pisz pstate przez pstate_settle_ms po
     // power-cycle (kernel nvkm_pstate_calc może wisieć po D3hot→D0). Ustawiane
@@ -2935,8 +2974,8 @@ public:
             rollback_off();
             return false;
         }
-        // Krok 3: verify vgaswitcheroo = Pwr.
-        if (st.vgasw != "Pwr") {
+        // Krok 3: verify vgaswitcheroo = Pwr (DynPwr under runtime PM).
+        if (st.vgasw != "Pwr" && st.vgasw != "DynPwr") {
             last_error_ = "vgaswitcheroo != Pwr po power-on";
             logf(0, "switch: BŁĄD recovery — vgaswitcheroo=%s (oczekiwano Pwr)",
                  st.vgasw.c_str());
@@ -3019,6 +3058,24 @@ private:
                     logf(1, "switch: monitor — power-off zablokowany (topologia %s)",
                          topo_.name());
                     last_action_ = "blocked-off";
+                } else if (power_.runpm()) {
+                    // Runtime PM: no forced cut. With power/control=auto the kernel
+                    // suspends the card once no client uses it (patch 0010 waits for
+                    // GR idle) and wakes it on the next open. A card that is on here
+                    // is in use by a client the kernel woke it for — leave it.
+                    if (power_.control() != "auto") {
+                        logf(1, "switch: dGPU -> runtime PM (power/control=auto, target=IGPU)");
+                        if (power_.set_off()) {
+                            last_switch_ = now;
+                            last_action_ = "runpm-auto";
+                            last_error_.clear();
+                        } else {
+                            last_error_ = "set_off (power/control=auto) nieudany";
+                            logf(0, "switch: BŁĄD %s", last_error_.c_str());
+                        }
+                    } else {
+                        last_action_ = "none";
+                    }
                 } else {
                     logf(1, "switch: power-off dGPU (target=IGPU, topologia=IGD)");
                     if (!power_.wait_idle(cfg_.wait_idle_timeout_ms,
@@ -3854,7 +3911,7 @@ int main(int argc, char** argv)
 
         // v5.0: gate pstate — gdy dGPU OFF, pomiń sample() (BAR0 po power-cut =
         // śmieci = 1000‰ = boost do 0e na martwej karcie; lekcja raportu 63).
-        if (sw.enabled() && sw.dgpu_off()) {
+        if (sw.enabled() && sw.dgpu_off_live()) {
             g_last_busy = 0;   // zero phantom busy — inaczej g_last_busy zamrożone
                                // na ostatniej wartości (np. 1000‰) i switchd tick
                                // (miękka promocja busy-gated) widzi busy z martwej
